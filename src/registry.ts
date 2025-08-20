@@ -15,4 +15,10 @@ export default [
     endpoint: "https://gitmcp.io/docs",
     open: true,
   },
+  {
+    name: "huggingface",
+    transport: "http",
+    endpoint: "https://hf.co/mcp",
+    open: true,
+  },
 ];
