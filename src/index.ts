@@ -1,7 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { createBridge } from "./lib/bridge.js";
+import { runAggregator } from "./lib/aggregator.js";
 import { createLogger } from "./lib/logger.js";
 import registry from "./registry.js";
 
@@ -38,28 +36,35 @@ async function main() {
     process.exit(1);
   }
 
-  // TODO: support multiple servers
-  const server = servers[0];
+  // Resolve selected remotes from registry
+  const selected = servers.map((name) => {
+    const e = registry.find((r) => r.name === name);
+    if (!e || !e.endpoint) {
+      console.error(`Server not found in registry: ${name}`);
+      process.exit(1);
+    }
+    return e;
+  });
 
   const token = process.env.JWT_TOKEN;
-  if (!token) {
-    console.error("Missing JWT_TOKEN env var");
+  const requiresAuth = selected.some((e) => !e.open);
+  if (requiresAuth && !token) {
+    console.error(
+      "Missing JWT_TOKEN env var (required for one or more selected servers)"
+    );
     process.exit(1);
   }
 
-  const entry = registry.find((e) => e.name === server);
-  if (!entry || !entry.endpoint) {
-    console.error(`Server not found in registry: ${server}`);
-    process.exit(1);
-  }
-
-  const headers = entry.open ? {} : { Authorization: `Bearer ${token}` };
-
-  await createBridge({
-    url: entry.endpoint,
-    transport: entry.transport === "sse" ? "sse" : "http",
-    headers,
+  // Multi-remote: run in-process aggregator with name-prefix routing
+  await runAggregator({
+    remotes: selected.map((e) => ({
+      name: e.name,
+      url: e.endpoint,
+      transport: e.transport === "sse" ? "sse" : "http",
+      headers: e.open ? {} : { Authorization: `Bearer ${token}` },
+    })),
     log,
+    serverInfo: { name: "mcp-concierge", version: "0.0.1" },
   });
 }
 

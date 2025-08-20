@@ -10,6 +10,9 @@ export type BridgeOpts = {
   log: Logger;
 };
 
+/**
+ * @deprecated only useful for single remote connections but keeping it for now for reference
+ */
 export async function createBridge(opts: BridgeOpts) {
   const { url, transport, headers, log } = opts;
   const remoteUrl = new URL(url);
