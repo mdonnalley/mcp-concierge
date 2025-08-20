@@ -20,6 +20,7 @@ type Remote = {
   cfg: RemoteConfig;
   client: Client;
   transport: StreamableHTTPClientTransport | SSEClientTransport;
+  keepaliveInterval?: NodeJS.Timeout;
 };
 
 type ToolInfo = {
@@ -65,7 +66,11 @@ export async function runAggregator(opts: {
     let transport: StreamableHTTPClientTransport | SSEClientTransport;
     if (cfg.transport === "sse") {
       transport = new SSEClientTransport(url, {
-        eventSourceInit: { headers: cfg.headers } as any,
+        eventSourceInit: {
+          headers: cfg.headers,
+          // Add keepalive options to prevent timeout
+          heartbeatTimeout: 60000, // 60 seconds
+        } as any,
         requestInit: { headers: cfg.headers },
       });
     } else {
@@ -83,7 +88,62 @@ export async function runAggregator(opts: {
       name: `concierge:${cfg.name}`,
       version: "0.0.1",
     });
-    client.onerror = (e) => log.error(`[remote:${cfg.name}] error`, e);
+
+    // Enhanced error handling with automatic reconnection
+    client.onerror = async (e) => {
+      log.error(`[remote:${cfg.name}] error`, e);
+
+      // For SSE timeout errors, attempt to reconnect
+      if (
+        cfg.transport === "sse" &&
+        e.message?.includes("Body Timeout Error")
+      ) {
+        log.info(`[remote:${cfg.name}] attempting to reconnect due to timeout`);
+        try {
+          // Find and clean up the old remote
+          const oldRemoteIndex = remotes.findIndex(
+            (r) => r.cfg.name === cfg.name
+          );
+          if (oldRemoteIndex >= 0) {
+            const oldRemote = remotes[oldRemoteIndex];
+            if (oldRemote && oldRemote.keepaliveInterval) {
+              clearInterval(oldRemote.keepaliveInterval);
+            }
+          }
+
+          await client.close();
+          await transport.close();
+
+          // Recreate the remote connection
+          setTimeout(async () => {
+            try {
+              const newRemote = await connectRemote(cfg);
+              if (newRemote) {
+                // Replace the old remote in the remotes array
+                const index = remotes.findIndex((r) => r.cfg.name === cfg.name);
+                if (index >= 0) {
+                  remotes[index] = newRemote;
+                  await refreshRemoteTools(cfg.name, newRemote.client);
+                  await server.sendToolListChanged();
+                  log.info(`[remote:${cfg.name}] successfully reconnected`);
+                }
+              }
+            } catch (reconnectError) {
+              log.error(
+                `[remote:${cfg.name}] reconnection failed`,
+                reconnectError
+              );
+            }
+          }, 2000); // Wait 2 seconds before reconnecting
+        } catch (cleanupError) {
+          log.warn(
+            `[remote:${cfg.name}] cleanup error during reconnection`,
+            cleanupError
+          );
+        }
+      }
+    };
+
     client.fallbackNotificationHandler = async (n) => {
       if (n.method === "notifications/tools/list_changed") {
         await refreshRemoteTools(cfg.name, client).catch((e) =>
@@ -94,12 +154,41 @@ export async function runAggregator(opts: {
     };
 
     // Try to connect; for SSE allow a couple retries
+    let keepaliveInterval: NodeJS.Timeout | undefined;
     if (cfg.transport === "sse") {
       let attempt = 0;
       while (true) {
         try {
           await client.connect(transport as any);
           log.info(`[remote:${cfg.name}] connected (sse)`);
+
+          // Set up periodic keepalive for SSE connections to prevent timeout
+          keepaliveInterval = setInterval(async () => {
+            try {
+              // Attempt a simple operation to keep the connection alive
+              await client.listTools({});
+            } catch (e) {
+              log.warn(
+                `[remote:${cfg.name}] keepalive failed`,
+                (e as Error).message
+              );
+              if (keepaliveInterval) {
+                clearInterval(keepaliveInterval);
+                keepaliveInterval = undefined;
+              }
+            }
+          }, 30000); // Every 30 seconds
+
+          // Clean up keepalive when client closes
+          const originalClose = client.close.bind(client);
+          client.close = async () => {
+            if (keepaliveInterval) {
+              clearInterval(keepaliveInterval);
+              keepaliveInterval = undefined;
+            }
+            return originalClose();
+          };
+
           break;
         } catch (e) {
           attempt++;
@@ -116,7 +205,11 @@ export async function runAggregator(opts: {
       log.info(`[remote:${cfg.name}] connected (http)`);
     }
 
-    return { cfg, client, transport };
+    const remote: Remote = { cfg, client, transport };
+    if (keepaliveInterval) {
+      remote.keepaliveInterval = keepaliveInterval;
+    }
+    return remote;
   }
 
   async function refreshRemoteTools(name: string, client: Client) {
@@ -182,6 +275,12 @@ export async function runAggregator(opts: {
 
   // Wire transports lifecycle
   server.onclose = async () => {
+    // Clean up keepalive intervals first
+    remotes.forEach((r) => {
+      if (r.keepaliveInterval) {
+        clearInterval(r.keepaliveInterval);
+      }
+    });
     await Promise.allSettled(remotes.map((r) => r.client.close()));
     await Promise.allSettled(remotes.map((r) => r.transport.close()));
     process.exit(0);
